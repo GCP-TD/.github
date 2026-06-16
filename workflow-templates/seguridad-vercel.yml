@@ -1,0 +1,64 @@
+name: Secure CI/CD to Vercel
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  security_audits:
+    name: Pruebas de Seguridad
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necesario para que Gitleaks revise todo el historial
+
+      - name: Escaneo de Secretos (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: true
+
+      - name: Análisis Estático de Seguridad (Semgrep SAST)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: "p/default" # Reglas por defecto para encontrar bugs de seguridad comunes
+
+      - name: Auditoría de Dependencias (SCA)
+        run: npm audit --audit-level=high
+        # Falla el pipeline si encuentra vulnerabilidades altas o críticas en el package.json
+
+  deploy_to_vercel:
+    name: Despliegue en Vercel
+    needs: security_audits # ESTO ES CLAVE: Solo se ejecuta si pasa el job anterior
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Instalar Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Desplegar en Vercel (Producción)
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          
+      - name: Build en Vercel
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Publicar en Vercel
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
