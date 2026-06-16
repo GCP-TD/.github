@@ -5,9 +5,5 @@
     "categories": [
         "Security",
         "Deployment"
-    ],
-    "filePatterns": [
-        "package.json",
-        "next.config.js"
     ]
 }
