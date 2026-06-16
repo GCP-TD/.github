@@ -13,10 +13,10 @@ jobs:
     name: Pruebas de Seguridad
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout del código
+      - name: Checkout del codigo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Necesario para que Gitleaks revise todo el historial
+          fetch-depth: 0
 
       - name: Escaneo de Secretos (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
@@ -24,28 +24,27 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: true
 
-      - name: Análisis Estático de Seguridad (Semgrep SAST)
+      - name: Analisis Estatico de Seguridad (Semgrep SAST)
         uses: returntocorp/semgrep-action@v1
         with:
-          config: "p/default" # Reglas por defecto para encontrar bugs de seguridad comunes
+          config: "p/default"
 
-      - name: Auditoría de Dependencias (SCA)
+      - name: Auditoria de Dependencias (SCA)
         run: npm audit --audit-level=high
-        # Falla el pipeline si encuentra vulnerabilidades altas o críticas en el package.json
 
   deploy_to_vercel:
     name: Despliegue en Vercel
-    needs: security_audits # ESTO ES CLAVE: Solo se ejecuta si pasa el job anterior
+    needs: security_audits
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - name: Checkout del código
+      - name: Checkout del codigo
         uses: actions/checkout@v4
 
       - name: Instalar Vercel CLI
         run: npm install --global vercel@latest
 
-      - name: Desplegar en Vercel (Producción)
+      - name: Desplegar en Vercel (Produccion)
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
         env:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
