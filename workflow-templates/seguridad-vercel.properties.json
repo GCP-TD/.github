@@ -1,0 +1,13 @@
+{
+    "name": "DevSecOps Despliegue a Vercel",
+    "description": "Flujo corporativo obligatorio para escanear credenciales y vulnerabilidades antes de publicar en Vercel.",
+    "iconName": "shield",
+    "categories": [
+        "Security",
+        "Deployment"
+    ],
+    "filePatterns": [
+        "package.json",
+        "next.config.js"
+    ]
+}
