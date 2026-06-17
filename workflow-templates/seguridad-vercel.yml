@@ -160,15 +160,9 @@ jobs:
         shell: bash
         run: |
           echo "::warning::Vulnerabilidad detectada. Iniciando rollback automatico..."
-          
-          # Firma corporativa para el historial de Git
           git config --global user.name "DevSecOps Gate"
           git config --global user.email "ciberseguridad@casapellas.com"
-          
-          # Revierte el commit inyectado por el usuario
           git revert --no-edit ${{ github.sha }}
-          
-          # Sube la reversion a la rama main
           git push origin main
           
           echo "::notice::El codigo vulnerable ha sido revertido exitosamente."
