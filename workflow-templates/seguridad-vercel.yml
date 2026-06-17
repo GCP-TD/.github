@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: security-gate-${{ github.ref }}
@@ -40,7 +40,6 @@ jobs:
           [[rules]]
           id = "corporate-strict-hardcoded-secret"
           description = "Detects generic hardcoded credentials in English and Spanish, including short or weak values."
-          # Regex ajustada para incluir terminos en español (llave, clave, contrasena) y reducir el limite a 4 caracteres.
           regex = '''(?i)(?:secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd|llave|clave|contrasena|secreto)[A-Za-z0-9_-]*\s*[:=]\s*['"`]([A-Za-z0-9_./+=:@-]{4,})['"`]'''
           secretGroup = 1
           keywords = [
@@ -156,6 +155,24 @@ jobs:
           console.log('No se detectaron dependencias no utilizadas.');
           NODE
 
+      - name: Rollback automatico en main
+        if: failure()
+        shell: bash
+        run: |
+          echo "::warning::Vulnerabilidad detectada. Iniciando rollback automatico..."
+          
+          # Firma corporativa para el historial de Git
+          git config --global user.name "DevSecOps Gate"
+          git config --global user.email "ciberseguridad@casapellas.com"
+          
+          # Revierte el commit inyectado por el usuario
+          git revert --no-edit ${{ github.sha }}
+          
+          # Sube la reversion a la rama main
+          git push origin main
+          
+          echo "::notice::El codigo vulnerable ha sido revertido exitosamente."
+
       - name: Alertar a Ciberseguridad si falla el gate
         if: failure()
         shell: bash
@@ -173,7 +190,7 @@ jobs:
             --arg workflow "${{ github.workflow }}" \
             --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --arg ref "${{ github.ref }}" \
-            '{repository: $repository, actor: $actor, workflow: $workflow, ref: $ref, run_url: $run_url, status: "blocked"}')
+            '{repository: $repository, actor: $actor, workflow: $workflow, ref: $ref, run_url: $run_url, status: "Bloqueado y Revertido"}')
 
           curl --fail --silent --show-error \
             -H "Content-Type: application/json" \
