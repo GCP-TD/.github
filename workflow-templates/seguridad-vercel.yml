@@ -1,4 +1,4 @@
-name: Secure CI/CD to Vercel
+name: Corporate DevSecOps Gate
 
 on:
   push:
@@ -7,57 +7,175 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-gate-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   security_audits:
-    name: Pruebas de Seguridad
+    name: Pruebas de Seguridad y Calidad
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - name: Checkout del codigo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Escaneo de Secretos (Gitleaks)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_COMMENTS: true
+      - name: Preparar reglas corporativas de secretos (Estricto / Multi-idioma)
+        shell: bash
+        run: |
+          cat > .gitleaks-ci.toml <<'EOF'
+          title = "Corporate DevSecOps Gitleaks Config - Strict"
 
-      - name: Analisis Estatico de Seguridad (Semgrep SAST)
-        uses: returntocorp/semgrep-action@v1
+          [extend]
+          useDefault = true
+
+          [[rules]]
+          id = "corporate-strict-hardcoded-secret"
+          description = "Detects generic hardcoded credentials in English and Spanish, including short or weak values."
+          # Regex ajustada para incluir terminos en español (llave, clave, contrasena) y reducir el limite a 4 caracteres.
+          regex = '''(?i)(?:secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd|llave|clave|contrasena|secreto)[A-Za-z0-9_-]*\s*[:=]\s*['"`]([A-Za-z0-9_./+=:@-]{4,})['"`]'''
+          secretGroup = 1
+          keywords = [
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "access_key",
+            "client_secret",
+            "private_key",
+            "password",
+            "passwd",
+            "pwd",
+            "llave",
+            "clave",
+            "contrasena",
+            "secreto"
+          ]
+          EOF
+
+      - name: Escaneo de secretos hardcodeados (Gitleaks CLI)
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/repo" \
+            -w /repo \
+            ghcr.io/gitleaks/gitleaks:v8.24.2 \
+            git . --config .gitleaks-ci.toml --redact --verbose --exit-code 1
+
+      - name: Configurar Python para Semgrep
+        uses: actions/setup-python@v5
         with:
-          config: "p/default"
+          python-version: "3.12"
 
-      - name: Auditoria de Dependencias (SCA)
-        run: npm audit --audit-level=high
+      - name: Analisis estatico de seguridad (Semgrep SAST)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pipx
+          pipx install semgrep
+          semgrep scan \
+            --config p/default \
+            --config p/security-audit \
+            --config p/secrets \
+            --error \
+            --no-suppress-errors \
+            --metrics=off
 
-  deploy_to_vercel:
-    name: Despliegue en Vercel
-    needs: security_audits
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - name: Checkout del codigo
-        uses: actions/checkout@v4
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-      - name: Instalar Vercel CLI
-        run: npm install --global vercel@latest
+      - name: Validar sintaxis JavaScript
+        shell: bash
+        run: |
+          mapfile -d '' files < <(find . \
+            -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) \
+            -not -path './node_modules/*' \
+            -not -path './.git/*' \
+            -print0)
 
-      - name: Desplegar en Vercel (Produccion)
-        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No se encontraron archivos JavaScript para validar."
+            exit 0
+          fi
+
+          for file in "${files[@]}"; do
+            node --check "$file"
+          done
+
+      - name: Auditoria de dependencias Node.js (SCA)
+        shell: bash
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::notice::No existe package.json; se omite npm audit porque este repositorio no declara dependencias Node.js."
+            exit 0
+          fi
+
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci --ignore-scripts
+          else
+            npm install --package-lock-only --ignore-scripts
+          fi
+
+          npm audit --audit-level=high
+
+      - name: Detectar dependencias instaladas no utilizadas
+        shell: bash
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::notice::No existe package.json; se omite depcheck."
+            exit 0
+          fi
+
+          npx --yes depcheck --json > depcheck-results.json
+
+          node <<'NODE'
+          const fs = require('fs');
+          const report = JSON.parse(fs.readFileSync('depcheck-results.json', 'utf8'));
+          const unused = [
+            ...(report.dependencies || []),
+            ...(report.devDependencies || []),
+          ];
+
+          if (unused.length > 0) {
+            console.error('Dependencias no utilizadas detectadas:');
+            for (const dependency of unused) {
+              console.error(`- ${dependency}`);
+            }
+            process.exit(1);
+          }
+
+          console.log('No se detectaron dependencias no utilizadas.');
+          NODE
+
+      - name: Alertar a Ciberseguridad si falla el gate
+        if: failure()
+        shell: bash
         env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          
-      - name: Build en Vercel
-        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
-        env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          SECURITY_ALERT_WEBHOOK_URL: ${{ secrets.SECURITY_ALERT_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SECURITY_ALERT_WEBHOOK_URL" ]; then
+            echo "::notice::SECURITY_ALERT_WEBHOOK_URL no configurado; se omite alerta externa."
+            exit 0
+          fi
 
-      - name: Publicar en Vercel
-        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
-        env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          payload=$(jq -n \
+            --arg repository "${{ github.repository }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg workflow "${{ github.workflow }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg ref "${{ github.ref }}" \
+            '{repository: $repository, actor: $actor, workflow: $workflow, ref: $ref, run_url: $run_url, status: "blocked"}')
+
+          curl --fail --silent --show-error \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$SECURITY_ALERT_WEBHOOK_URL"
