@@ -28,6 +28,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Bloquear archivos sensibles versionados
+        shell: bash
+        run: |
+          blocked_files=$(git ls-files | grep -E '(^|/)\.env($|\.|/)|(^|/).*\.(pem|p12|pfx|key)$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)credentials\.json$|(^|/)service-account.*\.json$' | grep -vE '(^|/)\.env\.example$' || true)
+
+          if [ -n "$blocked_files" ]; then
+            echo "::error::Archivos sensibles versionados detectados. No se permite publicar .env, llaves privadas, certificados ni credenciales."
+            printf '%s\n' "$blocked_files"
+            exit 1
+          fi
+
       - name: Preparar reglas corporativas de secretos (Estricto / Multi-idioma)
         shell: bash
         run: |
@@ -83,8 +94,9 @@ jobs:
             --config p/default \
             --config p/security-audit \
             --config p/secrets \
+            --config p/javascript \
+            --config p/nodejs \
             --error \
-            --no-suppress-errors \
             --metrics=off
 
       - name: Configurar Node.js
@@ -97,8 +109,8 @@ jobs:
         run: |
           mapfile -d '' files < <(find . \
             -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) \
-            -not -path './node_modules/*' \
-            -not -path './.git/*' \
+            -not -path '*/node_modules/*' \
+            -not -path '*/.git/*' \
             -print0)
 
           if [ "${#files[@]}" -eq 0 ]; then
@@ -110,61 +122,97 @@ jobs:
             node --check "$file"
           done
 
-      - name: Auditoria de dependencias Node.js (SCA)
+      - name: Auditoria de dependencias Node.js en Subcarpetas (SCA)
         shell: bash
         run: |
-          if [ ! -f package.json ]; then
-            echo "::notice::No existe package.json; se omite npm audit porque este repositorio no declara dependencias Node.js."
+          mapfile -d '' package_files < <(find . -name "package.json" -not -path "*/node_modules/*" -print0)
+          
+          if [ ${#package_files[@]} -eq 0 ]; then
+            echo "::notice::No existe package.json en ningun directorio; se omite npm audit."
             exit 0
           fi
+          
+          for pkg in "${package_files[@]}"; do
+            dir=$(dirname "$pkg")
+            echo "::group::Auditando directorio: $dir"
+            pushd "$dir" > /dev/null
+            
+            if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+              npm ci --ignore-scripts
+            else
+              npm install --package-lock-only --ignore-scripts
+            fi
+            
+            npm audit --audit-level=high
+            popd > /dev/null
+            echo "::endgroup::"
+          done
 
-          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-            npm ci --ignore-scripts
-          else
-            npm install --package-lock-only --ignore-scripts
-          fi
-
-          npm audit --audit-level=high
-
-      - name: Detectar dependencias instaladas no utilizadas
+      - name: Detectar dependencias no utilizadas en Subcarpetas
         shell: bash
         run: |
-          if [ ! -f package.json ]; then
+          mapfile -d '' package_files < <(find . -name "package.json" -not -path "*/node_modules/*" -print0)
+          
+          if [ ${#package_files[@]} -eq 0 ]; then
             echo "::notice::No existe package.json; se omite depcheck."
             exit 0
           fi
-
-          npx --yes depcheck --json > depcheck-results.json
-
-          node <<'NODE'
-          const fs = require('fs');
-          const report = JSON.parse(fs.readFileSync('depcheck-results.json', 'utf8'));
-          const unused = [
-            ...(report.dependencies || []),
-            ...(report.devDependencies || []),
-          ];
-
-          if (unused.length > 0) {
-            console.error('Dependencias no utilizadas detectadas:');
-            for (const dependency of unused) {
-              console.error(`- ${dependency}`);
+          
+          for pkg in "${package_files[@]}"; do
+            dir=$(dirname "$pkg")
+            echo "::group::Revisando dependencias huerfanas en: $dir"
+            pushd "$dir" > /dev/null
+            
+            # Ejecutamos depcheck y guardamos la salida, omitiendo fallos temporales de la propia herramienta
+            npx --yes depcheck --json > depcheck-results.json || true
+            
+            node <<'NODE'
+            const fs = require('fs');
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync('depcheck-results.json', 'utf8'));
+            } catch (e) {
+              console.error('No se pudo procesar depcheck-results.json.');
+              process.exit(0);
             }
-            process.exit(1);
-          }
-
-          console.log('No se detectaron dependencias no utilizadas.');
+            
+            const unused = [
+              ...(report.dependencies || []),
+              ...(report.devDependencies || []),
+            ];
+            
+            if (unused.length > 0) {
+              console.error('Se detectaron dependencias no utilizadas en esta ruta:');
+              for (const dependency of unused) {
+                console.error(`- ${dependency}`);
+              }
+              process.exit(1);
+            }
+            console.log('Todas las dependencias estan en uso correcto.');
           NODE
+            
+            popd > /dev/null
+            echo "::endgroup::"
+          done
 
       - name: Rollback automatico en main
-        if: failure()
+        if: failure() && github.event_name == 'push'
         shell: bash
+        env:
+          SHA_TO_REVERT: ${{ github.sha }}
         run: |
           echo "::warning::Vulnerabilidad detectada. Iniciando rollback automatico..."
           git config --global user.name "DevSecOps Gate"
           git config --global user.email "ciberseguridad@casapellas.com"
-          git revert --no-edit ${{ github.sha }}
-          git push origin main
           
+          # Deteccion de merge commit o push directo
+          if git show -s --format=%P "$SHA_TO_REVERT" | grep -q ' '; then
+            git revert --no-edit -m 1 "$SHA_TO_REVERT"
+          else
+            git revert --no-edit "$SHA_TO_REVERT"
+          fi
+          
+          git push origin main
           echo "::notice::El codigo vulnerable ha sido revertido exitosamente."
 
       - name: Alertar a Ciberseguridad si falla el gate
@@ -172,21 +220,48 @@ jobs:
         shell: bash
         env:
           SECURITY_ALERT_WEBHOOK_URL: ${{ secrets.SECURITY_ALERT_WEBHOOK_URL }}
+          ALERT_REPOSITORY: ${{ github.repository }}
+          ALERT_ACTOR: ${{ github.actor }}
+          ALERT_WORKFLOW: ${{ github.workflow }}
+          ALERT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ALERT_REF: ${{ github.ref }}
         run: |
           if [ -z "$SECURITY_ALERT_WEBHOOK_URL" ]; then
             echo "::notice::SECURITY_ALERT_WEBHOOK_URL no configurado; se omite alerta externa."
             exit 0
           fi
 
+          repo_name="${ALERT_REPOSITORY#*/}"
+          owner_user="${repo_name%%_*}"
+          if [ -z "$owner_user" ] || [ "$owner_user" = "$repo_name" ]; then
+            owner_user="$ALERT_ACTOR"
+          fi
+
+          security_alert_to="ciberseguridad@casapellas.com"
+          owner_email="${owner_user}@casapellas.com"
+          alert_recipients="${security_alert_to};${owner_email}"
+
           payload=$(jq -n \
-            --arg repository "${{ github.repository }}" \
-            --arg actor "${{ github.actor }}" \
-            --arg workflow "${{ github.workflow }}" \
-            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --arg ref "${{ github.ref }}" \
-            '{repository: $repository, actor: $actor, workflow: $workflow, ref: $ref, run_url: $run_url, status: "Bloqueado y Revertido"}')
+            --arg repository "$ALERT_REPOSITORY" \
+            --arg actor "$ALERT_ACTOR" \
+            --arg workflow "$ALERT_WORKFLOW" \
+            --arg run_url "$ALERT_RUN_URL" \
+            --arg ref "$ALERT_REF" \
+            --arg alert_to "$security_alert_to" \
+            --arg owner_email "$owner_email" \
+            --arg email "$alert_recipients" \
+            --arg to "$alert_recipients" \
+            '{repository: $repository, actor: $actor, email: $email, workflow: $workflow, ref: $ref, run_url: $run_url, status: "Bloqueado y Revertido", alert_to: $alert_to, owner_email: $owner_email, to: $to, emailMessage: {To: $email, Subject: ("Alerta DevSecOps: " + $repository), Body: ("El gate bloqueo y revirtio cambios en " + $repository + ". Run: " + $run_url)}}')
 
           curl --fail --silent --show-error \
             -H "Content-Type: application/json" \
             -d "$payload" \
             "$SECURITY_ALERT_WEBHOOK_URL"
+
+      - name: Despliegue en Vercel (Produccion)
+        if: success() && github.event_name == 'push'
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN_SECRET }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-args: '--prod --yes'
