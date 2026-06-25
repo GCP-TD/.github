@@ -127,7 +127,7 @@ jobs:
       - name: Configurar Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Validar sintaxis JavaScript
         shell: bash
@@ -166,6 +166,7 @@ jobs:
             
             if [ -f pnpm-lock.yaml ]; then
               echo "Proyecto pnpm detectado. Instalando y auditando con pnpm."
+              corepack prepare pnpm@10 --activate
               pnpm install --frozen-lockfile --ignore-scripts
               pnpm audit --audit-level high
             elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
