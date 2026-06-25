@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - master
   pull_request:
     branches:
       - main
+      - master
   workflow_dispatch:
 
 permissions:
@@ -37,6 +39,27 @@ jobs:
             echo "::error::Archivos sensibles versionados detectados. No se permite publicar .env, llaves privadas, certificados ni credenciales."
             printf '%s\n' "$blocked_files"
             exit 1
+          fi
+
+      - name: Detectar cambios de aplicacion
+        id: app_changes
+        shell: bash
+        run: |
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            changed_files=$(git diff --name-only HEAD^ HEAD)
+          else
+            changed_files=$(git ls-files)
+          fi
+
+          app_files=$(printf '%s\n' "$changed_files" | grep -vE '^$|^\.github/workflows/seguridad-vercel\.yml$' || true)
+
+          if [ -n "$app_files" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Archivos de aplicacion detectados:"
+            printf '%s\n' "$app_files"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Solo cambio el workflow corporativo; se omite despliegue."
           fi
 
       - name: Preparar reglas corporativas de secretos (Estricto / Multi-idioma)
@@ -73,9 +96,11 @@ jobs:
 
       - name: Escaneo de secretos hardcodeados (Gitleaks CLI)
         shell: bash
+        env:
+          WORKSPACE_PATH: ${{ github.workspace }}
         run: |
           docker run --rm \
-            -v "${{ github.workspace }}:/repo" \
+            -v "$WORKSPACE_PATH:/repo" \
             -w /repo \
             ghcr.io/gitleaks/gitleaks:v8.24.2 \
             git . --config .gitleaks-ci.toml --redact --verbose --exit-code 1
@@ -128,26 +153,34 @@ jobs:
           mapfile -d '' package_files < <(find . -name "package.json" -not -path "*/node_modules/*" -print0)
           
           if [ ${#package_files[@]} -eq 0 ]; then
-            echo "::notice::No existe package.json en ningun directorio; se omite npm audit."
+            echo "::notice::No existe package.json en ningun directorio; se omite auditoria Node.js."
             exit 0
           fi
           
+          corepack enable || true
+
           for pkg in "${package_files[@]}"; do
             dir=$(dirname "$pkg")
             echo "::group::Auditando directorio: $dir"
             pushd "$dir" > /dev/null
             
-            if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            if [ -f pnpm-lock.yaml ]; then
+              echo "Proyecto pnpm detectado. Instalando y auditando con pnpm."
+              pnpm install --frozen-lockfile --ignore-scripts
+              pnpm audit --audit-level high
+            elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+              echo "Proyecto npm con lockfile detectado. Instalando y auditando con npm."
               npm ci --ignore-scripts
+              npm audit --audit-level=high
             else
+              echo "Proyecto npm sin lockfile detectado. Generando package-lock temporal para auditoria."
               npm install --package-lock-only --ignore-scripts
+              npm audit --audit-level=high
             fi
             
-            npm audit --audit-level=high
             popd > /dev/null
             echo "::endgroup::"
           done
-
       - name: Detectar dependencias no utilizadas en Subcarpetas
         shell: bash
         run: |
@@ -162,9 +195,9 @@ jobs:
             dir=$(dirname "$pkg")
             echo "::group::Revisando dependencias huerfanas en: $dir"
             pushd "$dir" > /dev/null
-            
-            # Ejecutamos depcheck y guardamos la salida, omitiendo fallos temporales de la propia herramienta
-            npx --yes depcheck --json > depcheck-results.json || true
+            # Vite/Astro y herramientas de build se usan desde package scripts/config, no siempre desde imports.
+            depcheck_ignores="vite,@vitejs/*,astro,typescript,eslint,prettier,tailwindcss,postcss,autoprefixer"
+            npx --yes depcheck --json --ignores="$depcheck_ignores" > depcheck-results.json || true
             
             node <<'NODE'
             const fs = require('fs');
@@ -195,11 +228,12 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Rollback automatico en main
+      - name: Rollback automatico
         if: failure() && github.event_name == 'push'
         shell: bash
         env:
           SHA_TO_REVERT: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           echo "::warning::Vulnerabilidad detectada. Iniciando rollback automatico..."
           git config --global user.name "DevSecOps Gate"
@@ -212,11 +246,114 @@ jobs:
             git revert --no-edit "$SHA_TO_REVERT"
           fi
           
-          git push origin main
+          git push origin "$REF_NAME"
           echo "::notice::El codigo vulnerable ha sido revertido exitosamente."
 
-      - name: Alertar a Ciberseguridad si falla el gate
-        if: failure()
+      - name: Auto-Aprovisionamiento en Vercel (API)
+        id: vercel_provisioning
+        if: success() && github.event_name == 'push' && steps.app_changes.outputs.changed == 'true'
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN || secrets.VERCEL_TOKEN_SECRET }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || secrets.VERCEL_ORG_ID }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::error::Falta configurar VERCEL_TOKEN o VERCEL_TOKEN_SECRET."
+            exit 1
+          fi
+
+          if [ -z "$VERCEL_TEAM_ID" ]; then
+            echo "::error::Falta configurar VERCEL_TEAM_ID o VERCEL_ORG_ID con el ID del team de Vercel."
+            exit 1
+          fi
+
+          PROJECT_NAME=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+
+          if [ -z "$PROJECT_NAME" ]; then
+            echo "::error::No se pudo derivar un nombre valido de proyecto Vercel desde el repositorio: $REPO_NAME"
+            exit 1
+          fi
+
+          echo "Consultando proyecto Vercel: $PROJECT_NAME"
+
+          project_response=$(mktemp)
+          http_code=$(curl -sS -o "$project_response" -w "%{http_code}" \
+            -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v9/projects/$PROJECT_NAME?teamId=$VERCEL_TEAM_ID")
+
+          if [ "$http_code" = "200" ]; then
+            PROJECT_ID=$(jq -r '.id // empty' "$project_response")
+            if [ -z "$PROJECT_ID" ]; then
+              echo "::error::La API encontro el proyecto, pero no devolvio un ID."
+              cat "$project_response"
+              exit 1
+            fi
+            echo "::notice::Proyecto existente encontrado en Vercel."
+          elif [ "$http_code" = "404" ]; then
+            echo "::notice::El proyecto no existe. Creandolo automaticamente en Vercel."
+            create_payload=$(jq -n --arg name "$PROJECT_NAME" '{name: $name}')
+            create_response=$(mktemp)
+            create_code=$(curl -sS -o "$create_response" -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$create_payload" \
+              "https://api.vercel.com/v11/projects?teamId=$VERCEL_TEAM_ID")
+
+            if [ "$create_code" != "200" ] && [ "$create_code" != "201" ]; then
+              echo "::error::Fallo al crear el proyecto en Vercel mediante la API. HTTP $create_code"
+              cat "$create_response"
+              exit 1
+            fi
+
+            PROJECT_ID=$(jq -r '.id // empty' "$create_response")
+            if [ -z "$PROJECT_ID" ]; then
+              echo "::error::Vercel creo/respondio el proyecto, pero no devolvio un ID."
+              cat "$create_response"
+              exit 1
+            fi
+            echo "::notice::Proyecto creado exitosamente en Vercel."
+          elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+            echo "::error::Vercel rechazo el token para el team/scope configurado. Revisa que VERCEL_TOKEN tenga acceso al equipo correcto y que VERCEL_TEAM_ID apunte a ese mismo team."
+            cat "$project_response"
+            exit 1
+          else
+            echo "::error::Error consultando Vercel API. HTTP $http_code"
+            cat "$project_response"
+            exit 1
+          fi
+
+          echo "project_id=$PROJECT_ID" >> "$GITHUB_OUTPUT"
+          echo "team_id=$VERCEL_TEAM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Despliegue en Vercel (Produccion)
+        if: success() && github.event_name == 'push' && steps.app_changes.outputs.changed == 'true'
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN || secrets.VERCEL_TOKEN_SECRET }}
+          RESOLVED_PROJECT_ID: ${{ steps.vercel_provisioning.outputs.project_id }}
+          VERCEL_TEAM_ID: ${{ steps.vercel_provisioning.outputs.team_id }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::error::Falta configurar VERCEL_TOKEN o VERCEL_TOKEN_SECRET."
+            exit 1
+          fi
+
+          if [ -z "$RESOLVED_PROJECT_ID" ] || [ -z "$VERCEL_TEAM_ID" ]; then
+            echo "::error::No se recibio project_id/team_id desde el auto-aprovisionamiento de Vercel."
+            exit 1
+          fi
+
+          mkdir -p .vercel
+          jq -n \
+            --arg orgId "$VERCEL_TEAM_ID" \
+            --arg projectId "$RESOLVED_PROJECT_ID" \
+            '{orgId: $orgId, projectId: $projectId}' > .vercel/project.json
+
+          npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN"
+      - name: Alertar a Ciberseguridad si falla el workflow
+        if: always() && failure()
         shell: bash
         env:
           SECURITY_ALERT_WEBHOOK_URL: ${{ secrets.SECURITY_ALERT_WEBHOOK_URL }}
@@ -227,18 +364,31 @@ jobs:
           ALERT_REF: ${{ github.ref }}
         run: |
           if [ -z "$SECURITY_ALERT_WEBHOOK_URL" ]; then
-            echo "::notice::SECURITY_ALERT_WEBHOOK_URL no configurado; se omite alerta externa."
+            echo "::warning::SECURITY_ALERT_WEBHOOK_URL no configurado; no se pudo enviar alerta externa."
             exit 0
           fi
 
           repo_name="${ALERT_REPOSITORY#*/}"
-          owner_user="${repo_name%%_*}"
-          if [ -z "$owner_user" ] || [ "$owner_user" = "$repo_name" ]; then
-            owner_user="$ALERT_ACTOR"
+          owner_user=""
+          owner_email=""
+
+          if [ -f ".github/devsecops-owner.json" ]; then
+            owner_user=$(jq -r '.user // empty' .github/devsecops-owner.json)
+            owner_email=$(jq -r '.email // empty' .github/devsecops-owner.json)
+          fi
+
+          if [ -z "$owner_user" ]; then
+            owner_user="${repo_name%%_*}"
+            if [ -z "$owner_user" ] || [ "$owner_user" = "$repo_name" ]; then
+              owner_user="$ALERT_ACTOR"
+            fi
+          fi
+
+          if [ -z "$owner_email" ]; then
+            owner_email="${owner_user}@casapellas.com"
           fi
 
           security_alert_to="ciberseguridad@casapellas.com"
-          owner_email="${owner_user}@casapellas.com"
           alert_recipients="${security_alert_to};${owner_email}"
 
           payload=$(jq -n \
@@ -251,17 +401,18 @@ jobs:
             --arg owner_email "$owner_email" \
             --arg email "$alert_recipients" \
             --arg to "$alert_recipients" \
-            '{repository: $repository, actor: $actor, email: $email, workflow: $workflow, ref: $ref, run_url: $run_url, status: "Bloqueado y Revertido", alert_to: $alert_to, owner_email: $owner_email, to: $to, emailMessage: {To: $email, Subject: ("Alerta DevSecOps: " + $repository), Body: ("El gate bloqueo y revirtio cambios en " + $repository + ". Run: " + $run_url)}}')
+            '{repository: $repository, actor: $actor, email: $email, workflow: $workflow, ref: $ref, run_url: $run_url, status: "Fallido", alert_to: $alert_to, owner_email: $owner_email, to: $to, emailMessage: {To: $email, Subject: ("Alerta DevSecOps: fallo en " + $repository), Body: ("El workflow DevSecOps fallo en " + $repository + ". Run: " + $run_url)}}')
 
-          curl --fail --silent --show-error \
+          response_file=$(mktemp)
+          http_code=$(curl -sS -o "$response_file" -w "%{http_code}" \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "$SECURITY_ALERT_WEBHOOK_URL"
+            "$SECURITY_ALERT_WEBHOOK_URL")
 
-      - name: Despliegue en Vercel (Produccion)
-        if: success() && github.event_name == 'push'
-        uses: amondnet/vercel-action@v25
-        with:
-          vercel-token: ${{ secrets.VERCEL_TOKEN_SECRET }}
-          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
-          vercel-args: '--prod --yes'
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::El webhook SECURITY_ALERT_WEBHOOK_URL respondio HTTP $http_code."
+            cat "$response_file"
+            exit 1
+          fi
+
+          echo "::notice::Alerta enviada correctamente a Power Automate."
