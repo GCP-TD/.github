@@ -108,6 +108,11 @@ jobs:
           REPO_NAME: ${{ github.event.repository.name }}
         run: bash .github/devsecops/scripts/vercel-provision.sh
 
+      - name: Inyectar Edge Firewall corporativo
+        if: success() && github.event_name == 'push' && steps.app_changes.outputs.changed == 'true'
+        shell: bash
+        run: bash .github/devsecops/scripts/inject-edge-firewall.sh
+
       - name: Despliegue en Vercel (Produccion)
         if: success() && github.event_name == 'push' && steps.app_changes.outputs.changed == 'true'
         shell: bash
